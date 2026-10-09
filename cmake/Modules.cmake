@@ -1,7 +1,9 @@
 set(NC_Gateway_Api_URL "C:/Software/GitHub/NavalCommand/Gateway.Api")
-set(NC_Gateway_Api_REV aa0b979e1506e486f2e114061b3d8f46e1e1b652)
+set(NC_Gateway_Api_REV e61fed5447db02934ae232e187a1c3371cb3cd38)
 set(NC_Gateway_Grpc_Api_URL "C:/Software/GitHub/NavalCommand/Gateway.Grpc.Api")
-set(NC_Gateway_Grpc_Api_REV 7cd8723384487e42a1cf05f432f5973040de6296)
+set(NC_Gateway_Grpc_Api_REV d68aa9104ab571425a89aa94302528f7d7ad4817)
+
+
 
 
 
