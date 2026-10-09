@@ -1,4 +1,5 @@
 #include <NavalCommand/Gateway/Api/Codec.h>
+#include <charconv>
 #include <NavalCommand/Gateway/Grpc/Server.h>
 namespace NavalCommand::Gateway::Grpc {
 Server::Server(Api::IProvider &p, std::shared_ptr<spdlog::logger> logger)
@@ -6,6 +7,11 @@ Server::Server(Api::IProvider &p, std::shared_ptr<spdlog::logger> logger)
 Server::~Server() { Stop(); }
 std::expected<void, Api::Error> Server::Start(const std::string &endpoint) {
   if (server_ || !endpoint.starts_with("127.0.0.1:"))
+    return std::unexpected(Api::Error::Malformed);
+  const auto text = endpoint.substr(10);
+  unsigned portNumber = 0;
+  const auto parsed = std::from_chars(text.data(), text.data()+text.size(), portNumber);
+  if(parsed.ec != std::errc{} || parsed.ptr != text.data()+text.size() || portNumber==0 || portNumber>65535)
     return std::unexpected(Api::Error::Malformed);
   grpc::ServerBuilder b;
   b.SetMaxReceiveMessageSize(1048576);
