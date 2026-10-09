@@ -1,0 +1,5 @@
+find_package(GTest CONFIG REQUIRED)
+add_executable(gateway-tests NavalCommand/Gateway/Grpc/ServerTest.cpp)
+target_link_libraries(gateway-tests PRIVATE Gateway.Grpc.Mock GTest::gtest_main)
+NavalCommandConfigureTarget(gateway-tests)
+add_test(NAME gateway COMMAND gateway-tests)

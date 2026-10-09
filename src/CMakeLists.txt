@@ -1,0 +1,5 @@
+find_package(spdlog CONFIG REQUIRED)
+add_library(Gateway.Grpc STATIC NavalCommand/Gateway/Grpc/Server.cpp)
+target_include_directories(Gateway.Grpc PUBLIC "${PROJECT_SOURCE_DIR}/public")
+target_link_libraries(Gateway.Grpc PUBLIC Gateway.Api Gateway.Grpc.Api spdlog::spdlog)
+NavalCommandConfigureTarget(Gateway.Grpc)
