@@ -3,37 +3,37 @@
 #include <gtest/gtest.h>
 using namespace NavalCommand;
 TEST(Provider, RejectionsDuplicatesAndSessionReset) {
-	Gateway::Grpc::MockProvider p;
-	Orders::Api::Request r{"mock-session", "id", "unit-1", 1, Orders::Api::Waypoint{62, -10}};
-	auto first = p.Submit(r);
-	auto latitude = p.View()->units[0].position.latitudeDeg;
-	EXPECT_EQ(p.Submit(r).stage, first.stage);
-	EXPECT_EQ(p.View()->units[0].position.latitudeDeg, latitude);
-	p.Reset("new");
-	EXPECT_EQ(p.Submit(r).reason, "stale_session");
-	r.sessionId = "new";
-	p.Block();
-	EXPECT_EQ(p.Submit(r).reason, "protected_native_action");
-	EXPECT_EQ(p.View()->units[0].position.latitudeDeg, 61.96);
+	Gateway::Grpc::MockProvider provider;
+	Orders::Api::Request request{"mock-session", "id", "unit-1", 1, Orders::Api::Waypoint{62, -10}};
+	auto first = provider.Submit(request);
+	auto latitude = provider.View()->units[0].position.latitudeDeg;
+	EXPECT_EQ(provider.Submit(request).stage, first.stage);
+	EXPECT_EQ(provider.View()->units[0].position.latitudeDeg, latitude);
+	provider.Reset("new");
+	EXPECT_EQ(provider.Submit(request).reason, "stale_session");
+	request.sessionId = "new";
+	provider.Block();
+	EXPECT_EQ(provider.Submit(request).reason, "protected_native_action");
+	EXPECT_EQ(provider.View()->units[0].position.latitudeDeg, 61.96);
 }
 TEST(Provider, BoundedLedger) {
-	Gateway::Grpc::MockProvider p;
-	for (int i = 0; i < 128; ++i) {
-		Orders::Api::Request r{"mock-session", std::to_string(i), "invalid", 1, {}};
-		EXPECT_EQ(p.Submit(r).reason, "wrong_side_or_invalid_entity");
+	Gateway::Grpc::MockProvider provider;
+	for (int requestIndex = 0; requestIndex < 128; ++requestIndex) {
+		Orders::Api::Request request{"mock-session", std::to_string(requestIndex), "invalid", 1, {}};
+		EXPECT_EQ(provider.Submit(request).reason, "wrong_side_or_invalid_entity");
 	}
-	EXPECT_EQ(p.Submit({"mock-session", "overflow", "unit-1", 1, {}}).reason, "ledger_full");
+	EXPECT_EQ(provider.Submit({"mock-session", "overflow", "unit-1", 1, {}}).reason, "ledger_full");
 }
 TEST(Server, RealGrpcAndLoopbackGuard) {
-	Gateway::Grpc::MockProvider p;
-	Gateway::Grpc::Server server(p, {});
+	Gateway::Grpc::MockProvider provider;
+	Gateway::Grpc::Server server(provider, {});
 	EXPECT_FALSE(server.Start("0.0.0.0:50059"));
 	ASSERT_TRUE(server.Start("127.0.0.1:50059"));
 	auto client = navalcommand::gateway::v1::Gateway::NewStub(grpc::CreateChannel("127.0.0.1:50059", grpc::InsecureChannelCredentials()));
-	grpc::ClientContext c;
-	navalcommand::gateway::v1::WorldSnapshot w;
-	ASSERT_TRUE(client->GetView(&c, {}, &w).ok());
-	EXPECT_EQ(w.own_units_size(), 1);
-	EXPECT_EQ(w.tracks_size(), 0);
+	grpc::ClientContext context;
+	navalcommand::gateway::v1::WorldSnapshot snapshot;
+	ASSERT_TRUE(client->GetView(&context, {}, &snapshot).ok());
+	EXPECT_EQ(snapshot.own_units_size(), 1);
+	EXPECT_EQ(snapshot.tracks_size(), 0);
 	server.Stop();
 }
