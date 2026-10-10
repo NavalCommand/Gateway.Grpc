@@ -24,6 +24,34 @@ TEST(Provider, BoundedLedger) {
 	}
 	EXPECT_EQ(provider.Submit({"mock-session", "overflow", "unit-1", 1, {}}).reason, "ledger_full");
 }
+TEST(Provider, SimulatedRouteSequence) {
+	Gateway::Grpc::MockProvider provider;
+	using namespace Orders::Api;
+	Request request{"mock-session", "A", "unit-1", 1, Waypoint{62, -10, RouteMode::ReplaceRoute}};
+	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 1);
+	request.requestId = "B";
+	request.waypoint->routeMode = RouteMode::AppendWaypoint;
+	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 2);
+	EXPECT_EQ(provider.Status("mock-session", "B").stage, Stage::RouteMutated);
+	request.requestId = "C";
+	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 3);
+	EXPECT_EQ(provider.Submit(request).routeAfter.size(), 3);
+	request.requestId = "D";
+	request.waypoint->routeMode = RouteMode::ReplaceRoute;
+	auto receipt = provider.Submit(request);
+	EXPECT_EQ(receipt.routeBefore.size(), 3);
+	ASSERT_EQ(receipt.routeAfter.size(), 1);
+	EXPECT_EQ(receipt.routeAfter[0].label, "NC-D");
+	EXPECT_EQ(receipt.stage, Stage::RouteMutated);
+	EXPECT_EQ(provider.Status("mock-session", "D").stage, Stage::MovementObserved);
+	request.requestId = "legacy-active";
+	request.waypoint->routeMode = RouteMode::LegacyIdle;
+	EXPECT_EQ(provider.Submit(request).reason, "native_task_selection_active");
+	request.requestId = "unsupported-launch";
+	request.waypoint.reset();
+	request.facilityLaunch = FacilityLaunch{"class", "squadron", "loadout", 1};
+	EXPECT_EQ(provider.Submit(request).reason, "unsupported_order");
+}
 TEST(Server, RealGrpcAndLoopbackGuard) {
 	Gateway::Grpc::MockProvider provider;
 	Gateway::Grpc::Server server(provider, {});
