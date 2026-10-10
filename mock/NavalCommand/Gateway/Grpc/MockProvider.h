@@ -1,5 +1,6 @@
 #pragma once
 #include <NavalCommand/Gateway/Api/IProvider.h>
+#include <NavalCommand/Orders/Api/RouteMode.h>
 #include <cmath>
 #include <cstddef>
 #include <map>
@@ -89,13 +90,13 @@ namespace NavalCommand::Gateway::Grpc
 			{
 				result = reject("unsupported_order");
 			}
-			else if (!request.waypoint || !std::isfinite(request.waypoint->latitudeDeg) || !std::isfinite(request.waypoint->longitudeDeg) ||
-				std::abs(request.waypoint->latitudeDeg) > MAXIMUM_LATITUDE_DEGREES || std::abs(request.waypoint->longitudeDeg) > MAXIMUM_LONGITUDE_DEGREES)
+			else if (!request.routeCommand || !std::isfinite(request.routeCommand->latitudeDeg) || !std::isfinite(request.routeCommand->longitudeDeg) ||
+				std::abs(request.routeCommand->latitudeDeg) > MAXIMUM_LATITUDE_DEGREES || std::abs(request.routeCommand->longitudeDeg) > MAXIMUM_LONGITUDE_DEGREES)
 			{
 				result = reject("invalid_arguments");
 			}
-			else if (request.waypoint->routeMode != Orders::Api::RouteMode::LegacyIdle && request.waypoint->routeMode != Orders::Api::RouteMode::ReplaceRoute &&
-				request.waypoint->routeMode != Orders::Api::RouteMode::AppendWaypoint)
+			else if (request.routeCommand->routeMode != Orders::Api::RouteMode::LegacyIdle && request.routeCommand->routeMode != Orders::Api::RouteMode::ReplaceRoute &&
+				request.routeCommand->routeMode != Orders::Api::RouteMode::AppendWaypoint)
 			{
 				result = reject("unsupported_route_mode");
 			}
@@ -103,11 +104,11 @@ namespace NavalCommand::Gateway::Grpc
 			{
 				result = reject("stale_observation");
 			}
-			else if (m_View.units[0].orders[static_cast<std::size_t>(request.waypoint->routeMode)].availability != Orders::Api::Availability::Executable)
+			else if (m_View.units[0].orders[static_cast<std::size_t>(request.routeCommand->routeMode)].availability != Orders::Api::Availability::Executable)
 			{
-				result = reject(m_View.units[0].orders[static_cast<std::size_t>(request.waypoint->routeMode)].reason);
+				result = reject(m_View.units[0].orders[static_cast<std::size_t>(request.routeCommand->routeMode)].reason);
 			}
-			else if (request.waypoint->routeMode == Orders::Api::RouteMode::AppendWaypoint && m_View.units[0].plannedRoute.size() >= MAXIMUM_ROUTE_POINTS)
+			else if (request.routeCommand->routeMode == Orders::Api::RouteMode::AppendWaypoint && m_View.units[0].plannedRoute.size() >= MAXIMUM_ROUTE_POINTS)
 			{
 				result = reject("route_capacity");
 			}
@@ -115,17 +116,17 @@ namespace NavalCommand::Gateway::Grpc
 			{
 				m_View.units[0].position.latitudeDeg += SYNTHETIC_LATITUDE_CHANGE_DEGREES;
 				result = {request.sessionId, request.requestId, OrderStage::MovementObserved, "mock_displacement", 1, SYNTHETIC_DISPLACEMENT_METERS};
-				result.routeMode = request.waypoint->routeMode;
+				result.routeMode = request.routeCommand->routeMode;
 				result.routeBefore = m_View.units[0].plannedRoute;
-				if (request.waypoint->routeMode == Orders::Api::RouteMode::ReplaceRoute)
+				if (request.routeCommand->routeMode == Orders::Api::RouteMode::ReplaceRoute)
 				{
 					m_View.units[0].plannedRoute.clear();
 				}
-				m_View.units[0].plannedRoute.push_back({request.waypoint->latitudeDeg, request.waypoint->longitudeDeg, "NC-" + request.requestId});
+				m_View.units[0].plannedRoute.push_back({request.routeCommand->latitudeDeg, request.routeCommand->longitudeDeg, "NC-" + request.requestId});
 				result.routeAfter = m_View.units[0].plannedRoute;
 				m_View.units[0].orders[0].availability = Orders::Api::Availability::Blocked;
 				m_View.units[0].orders[0].reason = "native_task_selection_active";
-				if (request.waypoint->routeMode != Orders::Api::RouteMode::LegacyIdle)
+				if (request.routeCommand->routeMode != Orders::Api::RouteMode::LegacyIdle)
 				{
 					result.stage = OrderStage::RouteMutated;
 					result.reason = "mock_route_sequence";
@@ -169,4 +170,4 @@ namespace NavalCommand::Gateway::Grpc
 			}
 		}
 	};
-} // namespace NavalCommand::Gateway::Grpc
+}

@@ -1,10 +1,11 @@
 #include <NavalCommand/Gateway/Grpc/MockProvider.h>
 #include <NavalCommand/Gateway/Grpc/Server.h>
+#include <NavalCommand/Orders/Api/RouteCommand.h>
 #include <gtest/gtest.h>
 using namespace NavalCommand;
 TEST(Provider, RejectionsDuplicatesAndSessionReset) {
 	Gateway::Grpc::MockProvider provider;
-	Orders::Api::Request request{"mock-session", "id", "unit-1", 1, Orders::Api::Waypoint{62, -10}};
+	Orders::Api::Request request{"mock-session", "id", "unit-1", 1, Orders::Api::RouteCommand{62, -10}};
 	auto first = provider.Submit(request);
 	auto latitude = provider.View()->units[0].position.latitudeDeg;
 	EXPECT_EQ(provider.Submit(request).stage, first.stage);
@@ -27,17 +28,17 @@ TEST(Provider, BoundedLedger) {
 TEST(Provider, SimulatedRouteSequence) {
 	Gateway::Grpc::MockProvider provider;
 	using namespace Orders::Api;
-	Request request{"mock-session", "A", "unit-1", 1, Waypoint{62, -10, RouteMode::ReplaceRoute}};
+	Request request{"mock-session", "A", "unit-1", 1, RouteCommand{62, -10, RouteMode::ReplaceRoute}};
 	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 1);
 	request.requestId = "B";
-	request.waypoint->routeMode = RouteMode::AppendWaypoint;
+	request.routeCommand->routeMode = RouteMode::AppendWaypoint;
 	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 2);
 	EXPECT_EQ(provider.Status("mock-session", "B").stage, Stage::RouteMutated);
 	request.requestId = "C";
 	ASSERT_EQ(provider.Submit(request).routeAfter.size(), 3);
 	EXPECT_EQ(provider.Submit(request).routeAfter.size(), 3);
 	request.requestId = "D";
-	request.waypoint->routeMode = RouteMode::ReplaceRoute;
+	request.routeCommand->routeMode = RouteMode::ReplaceRoute;
 	auto receipt = provider.Submit(request);
 	EXPECT_EQ(receipt.routeBefore.size(), 3);
 	ASSERT_EQ(receipt.routeAfter.size(), 1);
@@ -45,10 +46,10 @@ TEST(Provider, SimulatedRouteSequence) {
 	EXPECT_EQ(receipt.stage, Stage::RouteMutated);
 	EXPECT_EQ(provider.Status("mock-session", "D").stage, Stage::MovementObserved);
 	request.requestId = "legacy-active";
-	request.waypoint->routeMode = RouteMode::LegacyIdle;
+	request.routeCommand->routeMode = RouteMode::LegacyIdle;
 	EXPECT_EQ(provider.Submit(request).reason, "native_task_selection_active");
 	request.requestId = "unsupported-launch";
-	request.waypoint.reset();
+	request.routeCommand.reset();
 	request.facilityLaunch = FacilityLaunch{"class", "squadron", "loadout", 1};
 	EXPECT_EQ(provider.Submit(request).reason, "unsupported_order");
 }
