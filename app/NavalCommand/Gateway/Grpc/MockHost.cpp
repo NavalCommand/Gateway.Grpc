@@ -5,14 +5,17 @@
 #include <thread>
 constexpr auto MOCK_HOST_LIFETIME = std::chrono::seconds(120);
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv)
+{
 	NavalCommand::Gateway::Grpc::MockProvider provider;
-	if (argc > 2 && std::string(argv[2]) == "blocked") {
+	if (argc > 2 && std::string(argv[2]) == "blocked")
+	{
 		provider.Block();
 	}
 	auto logger = spdlog::stdout_color_mt("mock-host");
 	NavalCommand::Gateway::Grpc::Server server(provider, logger);
-	if (!server.Start(argc > 1 ? argv[1] : "127.0.0.1:50052")) {
+	if (!server.Start(argc > 1 ? argv[1] : "127.0.0.1:50052"))
+	{
 		return 2;
 	}
 	std::cout << "MOCK_READY" << std::endl;
