@@ -58,17 +58,26 @@ grpc::Status Server::Connect(grpc::ServerContext *, const Api::Wire::Query *, Ap
 	if (!providerView) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
 	}
-	response->set_schema_version(3);
+	response->set_schema_version(4);
 	response->set_session_id(providerView->Snapshot.SessionId);
-	response->set_observer_id(providerView->Snapshot.ObserverId);
+	response->mutable_observer()->set_value(providerView->Snapshot.Observer.Value);
 	response->set_ready(providerView->Snapshot.Ready);
 	return grpc::Status::OK;
 }
 
-grpc::Status Server::GetView(grpc::ServerContext *, const Api::Wire::Query *, Api::Wire::WorldSnapshot *response) {
+grpc::Status Server::GetView(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::ObserverSnapshot *response) {
 	auto providerView = m_Provider.View();
 	if (!providerView || !providerView->Snapshot.Ready) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
+	}
+	if (query->session_id().empty() || query->observer().value().empty()) {
+		return {grpc::StatusCode::INVALID_ARGUMENT, "session_and_observer_required"};
+	}
+	if (query->session_id() != providerView->Snapshot.SessionId) {
+		return {grpc::StatusCode::FAILED_PRECONDITION, "stale_session"};
+	}
+	if (query->observer().value() != providerView->Snapshot.Observer.Value) {
+		return {grpc::StatusCode::NOT_FOUND, "wrong_observer"};
 	}
 	try {
 		*response = Api::Encode(providerView->Snapshot);
@@ -83,20 +92,24 @@ grpc::Status Server::DiscoverOrders(grpc::ServerContext *, const Api::Wire::Quer
 	if (!providerView || !providerView->Snapshot.Ready) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
 	}
-	if (query->unit_id().value().empty()) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "unit_id_required"};
+	if (query->observation().value().empty() || query->observer().value().empty()) {
+		return {grpc::StatusCode::INVALID_ARGUMENT, "observer_and_observation_required"};
 	}
 	if (query->session_id() != providerView->Snapshot.SessionId) {
 		return {grpc::StatusCode::FAILED_PRECONDITION, "stale_session"};
 	}
-	const auto unit = std::ranges::find_if(providerView->Snapshot.Instances, [&](const auto &instance) {
-		return instance.Identity.Value == query->unit_id().value();
+	if (query->observer().value() != providerView->Snapshot.Observer.Value) {
+		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_entity"};
+	}
+	const auto unit = std::ranges::find_if(providerView->Snapshot.Units, [&](const auto &observation) {
+		return observation.Identity.Value == query->observation().value();
 	});
-	if (unit == providerView->Snapshot.Instances.end()) {
-		return {grpc::StatusCode::NOT_FOUND, "wrong_side_or_invalid_entity"};
+	if (unit == providerView->Snapshot.Units.end()) {
+		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_entity"};
 	}
 	const auto availability = std::ranges::find_if(providerView->OrderAvailability, [&](const auto &entry) {
-		return entry.Unit.Value == query->unit_id().value();
+		return entry.Observer == providerView->Snapshot.Observer &&
+			entry.Observation.Value == query->observation().value();
 	});
 	if (availability == providerView->OrderAvailability.end() ||
 		availability->Orders.GetCoverage() == Uncertainty::Api::ObservedCollection<Orders::Api::Eligibility>::Coverage::Unknown) {
@@ -121,6 +134,17 @@ grpc::Status Server::SubmitOrder(grpc::ServerContext *, const Api::Wire::OrderRe
 }
 
 grpc::Status Server::GetStatus(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::OrderResult *response) {
+	if (query->observer().value().empty()) {
+		return {grpc::StatusCode::INVALID_ARGUMENT, "observer_required"};
+	}
+	auto providerView = m_Provider.View();
+	if (!providerView || !providerView->Snapshot.Ready) {
+		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
+	}
+	if (query->session_id() == providerView->Snapshot.SessionId &&
+		query->observer().value() != providerView->Snapshot.Observer.Value) {
+		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_request"};
+	}
 	*response = Api::Encode(m_Provider.Status(query->session_id(), query->request_id()));
 	return grpc::Status::OK;
 }

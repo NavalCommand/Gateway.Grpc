@@ -23,7 +23,7 @@ namespace NavalCommand::Gateway::Grpc
 
 	private:
 		grpc::Status Connect(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::Session*) override;
-		grpc::Status GetView(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::WorldSnapshot*) override;
+		grpc::Status GetView(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::ObserverSnapshot*) override;
 		grpc::Status DiscoverOrders(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::OrderDiscovery*) override;
 		grpc::Status SubmitOrder(grpc::ServerContext*, const Api::Wire::OrderRequest*, Api::Wire::OrderResult*) override;
 		grpc::Status GetStatus(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::OrderResult*) override;
