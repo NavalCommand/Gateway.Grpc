@@ -111,8 +111,7 @@ grpc::Status Server::DiscoverOrders(grpc::ServerContext *, const Api::Wire::Quer
 		return entry.Observer == providerView->Snapshot.Observer &&
 			entry.Observation.Value == query->observation().value();
 	});
-	if (availability == providerView->OrderAvailability.end() ||
-		availability->Orders.GetCoverage() == Uncertainty::Api::ObservedCollection<Orders::Api::Eligibility>::Coverage::Unknown) {
+	if (availability == providerView->OrderAvailability.end()) {
 		return {grpc::StatusCode::FAILED_PRECONDITION, "order_availability_unknown"};
 	}
 	try {

@@ -50,26 +50,28 @@ public:
 		snapshot.Ready = true;
 		snapshot.Version = 1;
 		using namespace Observations::Api;
-		using Uncertainty::Api::Knowledge;
-		using Uncertainty::Api::ObservedCollection;
 		UnitObservation own;
 		own.Identity = {"contact-alpha"};
-		own.Type = Knowledge<Catalog::Api::UnitTypeId>::Known({"mock-vessel"});
-		own.Kinematics.Position = Knowledge<Physics::Api::Position>::Known({{61.96}, {-10.37}, {}});
-		own.Kinematics.Speed = Knowledge<Physics::Api::MetersPerSecond>::Known({0});
-		own.Navigation = NavigationObservation{Knowledge<std::vector<ObservedRoutePoint>>::Known({})};
+		own.Name = Uncertainty::Api::Exact<std::string>::Known("Mock Vessel");
+		own.Type = Uncertainty::Api::Exact<Catalog::Api::UnitTypeId>::Known({"mock-vessel"});
+		own.Kinematics.Position = PartiallyLocalizedPosition{
+			Physics::Api::Degrees{61.96}, Physics::Api::Degrees{-10.37},
+			ObservedErrorEllipse{Physics::Api::Meters{25}, Physics::Api::Meters{20}, Physics::Api::Radians{0}}};
+		own.Kinematics.Speed = Uncertainty::Api::Exact<Physics::Api::MetersPerSecond>::Known({0});
+		own.Navigation = NavigationObservation{Uncertainty::Api::Exact<std::vector<ObservedRoutePoint>>::Known({})};
 		snapshot.Units.push_back(std::move(own));
 		UnitObservation ambiguous;
 		ambiguous.Identity = {"contact-beta"};
-		ambiguous.Type = Knowledge<Catalog::Api::UnitTypeId>::Estimated({"uncertain-class"}, "synthetic-observation-fixture");
-		ambiguous.Kinematics.Position = Knowledge<Physics::Api::Position>::Estimated({{62}, {-11}, {}}, "synthetic-observation-fixture");
+		ambiguous.Kinematics.Position = PartiallyLocalizedPosition{
+			Physics::Api::Degrees{62}, {},
+			ObservedErrorEllipse{Physics::Api::Meters{500}, Physics::Api::Meters{250}, Physics::Api::Radians{0}}};
 		// This ambiguous fixture deliberately has no correspondence to any simulated UnitId.
+		// The position is a partial localization; no contact name/type is reported.
 		snapshot.Units.push_back(std::move(ambiguous));
 		m_Observation.OrderAvailability.push_back({snapshot.Observer, {"contact-alpha"}, 1,
-			{ObservedCollection<Orders::Api::Eligibility>::Coverage::Complete,
-				{{Orders::Api::OrderKind::IdleWaypoint, Orders::Api::Availability::Executable, ""},
-				 {Orders::Api::OrderKind::ReplaceRoute, Orders::Api::Availability::Executable, ""},
-				 {Orders::Api::OrderKind::AppendRoute, Orders::Api::Availability::Executable, ""}}}});
+			{{Orders::Api::OrderKind::IdleWaypoint, Orders::Api::Availability::Executable, ""},
+			 {Orders::Api::OrderKind::ReplaceRoute, Orders::Api::Availability::Executable, ""},
+			 {Orders::Api::OrderKind::AppendRoute, Orders::Api::Availability::Executable, ""}}});
 	}
 
 	std::expected<Api::ProviderObservation, Api::Error> View() override {
@@ -113,16 +115,16 @@ public:
 			result = Reject(request, "unsupported_route_mode");
 		} else if (request.BasedOnVersion != snapshot.Version) {
 			result = Reject(request, "stale_observation");
-		} else if (overlay == m_Observation.OrderAvailability.end() ||
-			overlay->Orders.GetCoverage() == Uncertainty::Api::ObservedCollection<Eligibility>::Coverage::Unknown) {
+		} else if (overlay == m_Observation.OrderAvailability.end()) {
 			result = Reject(request, "order_availability_unknown");
 		} else {
 			const auto kind = route->Mode == RouteMode::ReplaceRoute ? OrderKind::ReplaceRoute :
 				route->Mode == RouteMode::AppendWaypoint ? OrderKind::AppendRoute : OrderKind::IdleWaypoint;
-			const auto eligibility = std::ranges::find_if(overlay->Orders.Items(), [&](const auto &entry) { return entry.Kind == kind; });
-			if (eligibility == overlay->Orders.Items().end()) {
-				result = Reject(request, overlay->Orders.GetCoverage() == Uncertainty::Api::ObservedCollection<Eligibility>::Coverage::Complete ?
-					"unsupported_order" : "order_availability_unknown");
+			const auto eligibility = std::ranges::find_if(overlay->Orders, [&](const auto &entry) { return entry.Kind == kind; });
+			if (eligibility == overlay->Orders.end()) {
+				result = Reject(request, "order_availability_unknown");
+			} else if (eligibility->Availability == Availability::Unsupported) {
+				result = Reject(request, eligibility->Reason.empty() ? "unsupported_order" : eligibility->Reason);
 			} else if (eligibility->Availability != Availability::Executable) {
 				result = Reject(request, eligibility->Reason.empty() ? "order_availability_unknown" : eligibility->Reason);
 			} else {
@@ -130,7 +132,6 @@ public:
 				if (route->Mode == RouteMode::AppendWaypoint && plannedRoute.size() >= MAXIMUM_ROUTE_POINTS) {
 					result = Reject(request, "route_capacity");
 				} else {
-					auto position = unit->Kinematics.Position.Value();
 					result.SessionId = request.SessionId;
 					result.RequestId = request.RequestId;
 					result.Observer = request.Observer;
@@ -146,13 +147,12 @@ public:
 						plannedRoute.clear();
 					}
 					plannedRoute.push_back({{route->Latitude, route->Longitude, {}}, "NC-" + request.RequestId});
-					position.Latitude.Value += SYNTHETIC_LATITUDE_CHANGE_DEGREES;
-					unit->Kinematics.Position = Uncertainty::Api::Knowledge<Physics::Api::Position>::Known(position);
-					for (std::size_t index = 0; index < plannedRoute.size(); ++index) {
-						result.RouteAfter.push_back(plannedRoute[index]);
+					std::get<Observations::Api::PartiallyLocalizedPosition>(unit->Kinematics.Position).Latitude->Value += SYNTHETIC_LATITUDE_CHANGE_DEGREES;
+					for (const auto &point : plannedRoute) {
+						result.RouteAfter.push_back(point);
 					}
-					overlay->Orders.At(0).Availability = Availability::Blocked;
-					overlay->Orders.At(0).Reason = "native_task_selection_active";
+					overlay->Orders[0].Availability = Availability::Blocked;
+					overlay->Orders[0].Reason = "native_task_selection_active";
 					if (route->Mode != RouteMode::IdleWaypoint) {
 						result.Stage = Stage::RouteMutated;
 						result.Reason = "mock_route_sequence";
@@ -190,12 +190,11 @@ public:
 
 	void Block() {
 		std::lock_guard lock(m_Mutex);
-		for (std::size_t index = 0; index < m_Observation.OrderAvailability[0].Orders.Items().size(); ++index) {
-			auto &eligibility = m_Observation.OrderAvailability[0].Orders.At(index);
+		for (auto &eligibility : m_Observation.OrderAvailability[0].Orders) {
 			eligibility.Availability = Orders::Api::Availability::Blocked;
 			eligibility.Reason = "protected_native_action";
-		}
 	}
+		}
 
 	void RevokeControl() {
 		std::lock_guard lock(m_Mutex);

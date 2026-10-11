@@ -64,20 +64,15 @@ TEST(Server, MissingAvailabilityNeverMeansExecutable) {
 	observation.OrderAvailability.push_back({{"fixture-observer"}, {"contact-own"}, 1, {}});
 	provider.SetSnapshot(observation);
 	grpc::ClientContext unknownContext;
-	EXPECT_EQ(client->DiscoverOrders(&unknownContext, query, &discovery).error_code(), grpc::StatusCode::FAILED_PRECONDITION);
-	using Collection = Uncertainty::Api::ObservedCollection<Orders::Api::Eligibility>;
-	observation.OrderAvailability[0].Orders = {Collection::Coverage::Partial, {}};
-	provider.SetSnapshot(observation);
-	grpc::ClientContext partialContext;
-	ASSERT_TRUE(client->DiscoverOrders(&partialContext, query, &discovery).ok());
-	EXPECT_EQ(discovery.eligibility().coverage(), navalcommand::gateway::v1::COVERAGE_PARTIAL);
+	ASSERT_TRUE(client->DiscoverOrders(&unknownContext, query, &discovery).ok());
 	EXPECT_EQ(discovery.eligibility().items_size(), 0);
 	EXPECT_EQ(discovery.observation().value(), "contact-own");
-	observation.OrderAvailability[0].Orders = {Collection::Coverage::Complete, {}};
+	observation.OrderAvailability[0].Orders.push_back({Orders::Api::OrderKind::IdleWaypoint, Orders::Api::Availability::Unknown, ""});
 	provider.SetSnapshot(observation);
-	grpc::ClientContext emptyContext;
-	ASSERT_TRUE(client->DiscoverOrders(&emptyContext, query, &discovery).ok());
-	EXPECT_EQ(discovery.eligibility().coverage(), navalcommand::gateway::v1::COVERAGE_COMPLETE);
+	grpc::ClientContext unknownEligibilityContext;
+	ASSERT_TRUE(client->DiscoverOrders(&unknownEligibilityContext, query, &discovery).ok());
+	EXPECT_EQ(discovery.eligibility().items_size(), 1);
+	EXPECT_EQ(discovery.eligibility().items(0).availability(), navalcommand::gateway::v1::UNKNOWN);
 	observation.Snapshot.Units[0].Identity.Value.clear();
 	provider.SetSnapshot(observation);
 	navalcommand::gateway::v1::ObserverSnapshot snapshot;
@@ -90,15 +85,15 @@ TEST(Provider, RejectionsDuplicatesAndSessionReset) {
 	Gateway::Grpc::MockProvider provider;
 	auto request = RouteRequest("id");
 	const auto first = provider.Submit(request);
-	const auto latitude = provider.View()->Snapshot.Units[0].Kinematics.Position.Value().Latitude.Value;
+	const auto latitude = std::get<Observations::Api::PartiallyLocalizedPosition>(provider.View()->Snapshot.Units[0].Kinematics.Position).Latitude->Value;
 	EXPECT_EQ(provider.Submit(request).Stage, first.Stage);
-	EXPECT_EQ(provider.View()->Snapshot.Units[0].Kinematics.Position.Value().Latitude.Value, latitude);
+	EXPECT_EQ(std::get<Observations::Api::PartiallyLocalizedPosition>(provider.View()->Snapshot.Units[0].Kinematics.Position).Latitude->Value, latitude);
 	provider.Reset("new");
 	EXPECT_EQ(provider.Submit(request).Reason, "stale_session");
 	request.SessionId = "new";
 	provider.Block();
 	EXPECT_EQ(provider.Submit(request).Reason, "protected_native_action");
-	EXPECT_EQ(provider.View()->Snapshot.Units[0].Kinematics.Position.Value().Latitude.Value, 61.96);
+	EXPECT_EQ(std::get<Observations::Api::PartiallyLocalizedPosition>(provider.View()->Snapshot.Units[0].Kinematics.Position).Latitude->Value, 61.96);
 }
 
 TEST(Provider, ObserverScopedIdentityIsNotAuthority) {
@@ -113,20 +108,28 @@ TEST(Provider, ObserverScopedIdentityIsNotAuthority) {
 	request.Observer = {"mock-observer"};
 	request.RequestId = "control-revoked";
 	provider.RevokeControl();
-	EXPECT_EQ(provider.View()->OrderAvailability[0].Orders.At(0).Availability, Orders::Api::Availability::Executable);
+	EXPECT_EQ(provider.View()->OrderAvailability[0].Orders[0].Availability, Orders::Api::Availability::Executable);
 	EXPECT_EQ(provider.Submit(request).Reason, "wrong_side_or_invalid_entity");
 	provider.Reset("next-session");
 	request.RequestId = "reused-handle-old-session";
 	EXPECT_EQ(provider.Submit(request).Reason, "stale_session");
 }
 
-TEST(Provider, UnknownAvailabilityAndRouteKnowledgeRemainDistinct) {
+TEST(Provider, MissingAvailabilityAndPartialLocationRemainDistinct) {
 	Gateway::Grpc::MockProvider provider;
 	const auto observation = provider.View();
 	ASSERT_TRUE(observation);
-	EXPECT_EQ(observation->Snapshot.Units[0].Navigation->PlannedRoute.Value().size(), 0);
-	EXPECT_FALSE(observation->Snapshot.Units[1].Navigation.has_value());
-	EXPECT_FALSE(observation->Snapshot.Units[1].Evidence.MeasuredAt.has_value());
+	EXPECT_TRUE(observation->Snapshot.Units[0].Navigation->PlannedRoute.HasValue());
+	EXPECT_TRUE(observation->Snapshot.Units[0].Navigation->PlannedRoute.Value().empty());
+	const auto &partial = observation->Snapshot.Units[1];
+	EXPECT_FALSE(partial.Type.HasValue());
+	const auto *partialPosition = std::get_if<Observations::Api::PartiallyLocalizedPosition>(&partial.Kinematics.Position);
+	ASSERT_NE(partialPosition, nullptr);
+	EXPECT_TRUE(partialPosition->Latitude.has_value());
+	EXPECT_FALSE(partialPosition->Longitude.has_value());
+	ASSERT_TRUE(partialPosition->ErrorEllipse.has_value());
+	EXPECT_TRUE(partial.Contributors.empty());
+	EXPECT_FALSE(partial.MeasuredAt.HasValue());
 	provider.ForgetAvailability();
 	EXPECT_EQ(provider.Submit(RouteRequest("unknown")).Reason, "order_availability_unknown");
 }
@@ -196,9 +199,23 @@ TEST(Server, ObserverSnapshotAndOrderOverlayNeverExposeTruthIdentity) {
 	EXPECT_EQ(client->GetView(&wrongObserverContext, wrongObserverQuery, &snapshot).error_code(), grpc::StatusCode::NOT_FOUND);
 	ASSERT_EQ(snapshot.units_size(), 2);
 	EXPECT_EQ(snapshot.units(0).identity().value(), "contact-alpha");
+	EXPECT_TRUE(snapshot.units(0).has_name());
+	EXPECT_EQ(snapshot.units(0).name(), "Mock Vessel");
+	EXPECT_TRUE(snapshot.units(0).kinematics().has_speed_mps());
+	EXPECT_EQ(snapshot.units(0).kinematics().speed_mps(), 0);
+	EXPECT_FALSE(snapshot.units(1).has_name());
 	EXPECT_EQ(snapshot.units(1).identity().value(), "contact-beta");
-	EXPECT_TRUE(snapshot.units(1).type().has_estimated());
-	EXPECT_FALSE(snapshot.units(1).evidence().measured_at_seconds().has_known());
+	EXPECT_FALSE(snapshot.units(1).has_type());
+	EXPECT_FALSE(snapshot.units(1).has_measured_at_seconds());
+	EXPECT_TRUE(snapshot.units(1).kinematics().has_partial_position());
+	EXPECT_TRUE(snapshot.units(1).kinematics().partial_position().has_latitude_deg());
+	EXPECT_FALSE(snapshot.units(1).kinematics().partial_position().has_longitude_deg());
+	EXPECT_TRUE(snapshot.units(1).kinematics().partial_position().has_error_ellipse());
+	EXPECT_EQ(snapshot.units(1).contributors_size(), 0);
+	const auto *contributors = snapshot.GetDescriptor()->FindFieldByName("units")->message_type()->FindFieldByName("contributors")->message_type();
+	ASSERT_NE(contributors, nullptr);
+	EXPECT_EQ(contributors->FindFieldByName("observer")->message_type()->name(), "ObservationId");
+	EXPECT_EQ(contributors->FindFieldByName("sensors")->message_type()->name(), "EquipmentTypeId");
 	EXPECT_EQ(snapshot.GetDescriptor()->FindFieldByName("units")->message_type()->FindFieldByName("unit_id"), nullptr);
 	EXPECT_EQ(snapshot.observer().value(), "mock-observer");
 	navalcommand::gateway::v1::Query query;
