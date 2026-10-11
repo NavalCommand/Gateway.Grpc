@@ -3,9 +3,11 @@
 Project-wide documentation is maintained in the separate **Docs Git repository**. Before changing this module, explicitly read [Docs/AGENTS.md](../Docs/AGENTS.md), [architecture](../Docs/ARCHITECTURE.md), [module/build policy](../Docs/MODULE_STRUCTURE.md), [local sources](../Docs/LOCAL_SOURCES.md), and [code style](../Docs/CODE_STYLE.md) with its [owner export](../Docs/CodeStyle.xml). The shared instructions are not discovered automatically across repository boundaries; do not create a competing AGENTS.md in the parent workspace. Historical reports and reproduction guides are indexed under [Docs/Tasks/](../Docs/Tasks/README.md), with run receipts under [Docs/Evidence/](../Docs/Evidence/README.md).
 
 
-Generic injected-provider C++ gRPC server; no Sea Power, C#, host ABI, loader or P/Invoke dependency. The existing public contract and gateway behavior are preserved. Inject an IProvider and logger, keep them alive for the server, and Start/Stop on the host I/O worker. Loopback only.
+Generic injected-provider C++ gRPC server; no Sea Power, C#, host ABI, loader or P/Invoke dependency. Inject an IProvider and logger, keep them alive for the server, and Start/Stop on the host I/O worker. Loopback only.
 
-Production library lives in src/. Gateway.Grpc.Mock is an interface target in mock/ for the existing header-only domain mock. app/mock-host.exe uses the same server, listens at its supplied loopback endpoint and exits after 120 s. test/gateway-tests.exe retains duplicate/session/protected/retention and real gRPC connectivity checks. Mock displacement is explicitly synthetic, not game evidence.
+The provider publishes `Gateway.Api::ProviderObservation`: an order-free `World.Api::View` snapshot and a separate per-unit `Orders.Api::OrderAvailability` overlay. `GetView` returns only the world; `DiscoverOrders` returns the explicit availability coverage, typed order kind and launch selectors. Observation, discovery and requests use the same opaque `Units.Api::UnitId`; identity never grants control. The mock validates an independent current-control set even when a prior overlay still says executable.
+
+Production library lives in src/. Gateway.Grpc.Mock is an interface target in mock/ for the header-only domain mock. app/mock-host.exe uses the same server, listens at its supplied loopback endpoint and exits after 120 s. test/gateway-tests.exe covers identity/current authority, unknown/partial/complete-empty discovery, malformed requests, duplicate/session/protected/retention and real gRPC connectivity. Route replace/append behavior and route-head-only synthetic movement remain operational; mock displacement is not game evidence. Contact measurement time remains unknown, rather than copying snapshot capture time.
 
 ## Build structure
 

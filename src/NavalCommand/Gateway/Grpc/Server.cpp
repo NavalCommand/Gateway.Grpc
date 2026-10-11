@@ -1,5 +1,6 @@
 #include <NavalCommand/Gateway/Api/Codec.h>
 #include <NavalCommand/Gateway/Grpc/Server.h>
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <string_view>
@@ -57,20 +58,20 @@ grpc::Status Server::Connect(grpc::ServerContext *, const Api::Wire::Query *, Ap
 	if (!providerView) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
 	}
-	response->set_schema_version(2);
-	response->set_session_id(providerView->sessionId);
-	response->set_observer_id(providerView->observerId);
-	response->set_ready(providerView->ready);
+	response->set_schema_version(3);
+	response->set_session_id(providerView->Snapshot.SessionId);
+	response->set_observer_id(providerView->Snapshot.ObserverId);
+	response->set_ready(providerView->Snapshot.Ready);
 	return grpc::Status::OK;
 }
 
 grpc::Status Server::GetView(grpc::ServerContext *, const Api::Wire::Query *, Api::Wire::WorldSnapshot *response) {
 	auto providerView = m_Provider.View();
-	if (!providerView || !providerView->ready) {
+	if (!providerView || !providerView->Snapshot.Ready) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
 	}
 	try {
-		*response = Api::Encode(*providerView);
+		*response = Api::Encode(providerView->Snapshot);
 	} catch (const std::invalid_argument &) {
 		return {grpc::StatusCode::FAILED_PRECONDITION, "invalid_provider_observation"};
 	}
@@ -79,35 +80,42 @@ grpc::Status Server::GetView(grpc::ServerContext *, const Api::Wire::Query *, Ap
 
 grpc::Status Server::DiscoverOrders(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::OrderDiscovery *response) {
 	auto providerView = m_Provider.View();
-	if (!providerView) {
+	if (!providerView || !providerView->Snapshot.Ready) {
 		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
 	}
-	response->set_session_id(providerView->sessionId);
-	if (!query->subject().has_own_unit_id() || query->subject().own_unit_id().empty()) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "own_unit_subject_required"};
+	if (query->unit_id().value().empty()) {
+		return {grpc::StatusCode::INVALID_ARGUMENT, "unit_id_required"};
 	}
-	response->mutable_subject()->set_own_unit_id(query->subject().own_unit_id());
-	if (query->session_id() != providerView->sessionId) {
+	if (query->session_id() != providerView->Snapshot.SessionId) {
 		return {grpc::StatusCode::FAILED_PRECONDITION, "stale_session"};
 	}
-	for (auto &unit : providerView->Instances) {
-		const auto own = std::get_if<Orders::Api::OwnUnitId>(&unit.Identity);
-		if (own && own->Value == query->subject().own_unit_id()) {
-			if (!unit.OrderEligibility || unit.OrderEligibility->Orders.GetCoverage() == World::Api::ObservedCollection<Orders::Api::Eligibility>::Coverage::Unknown) {
-				return {grpc::StatusCode::FAILED_PRECONDITION, "order_eligibility_unknown"};
-			}
-			*response->mutable_eligibility() = Api::Encode(*unit.OrderEligibility);
-			return grpc::Status::OK;
-		}
+	const auto unit = std::ranges::find_if(providerView->Snapshot.Instances, [&](const auto &instance) {
+		return instance.Identity.Value == query->unit_id().value();
+	});
+	if (unit == providerView->Snapshot.Instances.end()) {
+		return {grpc::StatusCode::NOT_FOUND, "wrong_side_or_invalid_entity"};
 	}
-	return {grpc::StatusCode::NOT_FOUND, "wrong_side_or_invalid_entity"};
+	const auto availability = std::ranges::find_if(providerView->OrderAvailability, [&](const auto &entry) {
+		return entry.Unit.Value == query->unit_id().value();
+	});
+	if (availability == providerView->OrderAvailability.end() ||
+		availability->Orders.GetCoverage() == Uncertainty::Api::ObservedCollection<Orders::Api::Eligibility>::Coverage::Unknown) {
+		return {grpc::StatusCode::FAILED_PRECONDITION, "order_availability_unknown"};
+	}
+	try {
+		*response = Api::Encode(*availability);
+		response->set_session_id(providerView->Snapshot.SessionId);
+	} catch (const std::invalid_argument &) {
+		return {grpc::StatusCode::FAILED_PRECONDITION, "invalid_provider_observation"};
+	}
+	return grpc::Status::OK;
 }
 
 grpc::Status Server::SubmitOrder(grpc::ServerContext *, const Api::Wire::OrderRequest *query, Api::Wire::OrderResult *response) {
 	try {
 		*response = Api::Encode(m_Provider.Submit(Api::Decode(*query)));
 	} catch (const std::invalid_argument &) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "own_unit_subject_required"};
+		return {grpc::StatusCode::INVALID_ARGUMENT, "invalid_order_payload"};
 	}
 	return grpc::Status::OK;
 }

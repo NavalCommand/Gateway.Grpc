@@ -28,4 +28,4 @@ namespace NavalCommand::Gateway::Grpc
 		grpc::Status SubmitOrder(grpc::ServerContext*, const Api::Wire::OrderRequest*, Api::Wire::OrderResult*) override;
 		grpc::Status GetStatus(grpc::ServerContext*, const Api::Wire::Query*, Api::Wire::OrderResult*) override;
 	};
-} // namespace NavalCommand::Gateway::Grpc
+}
