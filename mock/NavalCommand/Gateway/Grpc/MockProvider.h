@@ -1,209 +1,185 @@
 #pragma once
+
+#include <NavalCommand/Error/Api/MakeError.h>
 #include <NavalCommand/Gateway/Api/IProvider.h>
-#include <NavalCommand/Observations/Api/NavigationObservation.h>
-#include <NavalCommand/Orders/Api/RouteMode.h>
-#include <algorithm>
-#include <cmath>
-#include <cstddef>
-#include <map>
+#include <NavalCommand/Simulation/Api/Error.h>
 #include <mutex>
 #include <set>
 
-namespace NavalCommand::Gateway::Grpc {
-// Deliberately simulated execution, no game. Public handles are contacts, not truth IDs.
-class MockProvider final : public Api::IProvider {
-	static constexpr std::size_t MAXIMUM_RETAINED_REQUESTS = 128;
-	static constexpr std::size_t MAXIMUM_REQUEST_ID_CHARACTERS = 128;
-	static constexpr std::size_t MAXIMUM_ROUTE_POINTS = 32;
-	static constexpr double MAXIMUM_LATITUDE_DEGREES = 90;
-	static constexpr double MAXIMUM_LONGITUDE_DEGREES = 180;
-	static constexpr double SYNTHETIC_LATITUDE_CHANGE_DEGREES = 0.001;
-	static constexpr double SYNTHETIC_DISPLACEMENT_METERS = 111.0;
-	std::mutex m_Mutex;
-	Api::ProviderObservation m_Observation;
-	std::set<std::string> m_ControlledObservations;
-	std::map<std::string, Orders::Api::Result> m_Ledger;
+namespace NavalCommand::Gateway::Grpc
+{
+	// Controlled synthetic test infrastructure. No assertion of native behavior.
+	class MockProvider final : public Api::IProvider
+	{
+		mutable std::mutex m_Mutex;
+		std::string m_Session{"mock-mission"};
+		std::uint64_t m_Revision{1};
+		bool m_PlayerPaused{};
+		std::set<std::string> m_PauseOwners;
+		double m_Compression{1};
+		double m_Time{42};
 
-	Orders::Api::Result Reject(const Orders::Api::ExecutionRequest &request, std::string reason) const {
-		Orders::Api::Result result;
-		result.SessionId = request.SessionId;
-		result.RequestId = request.RequestId;
-		result.Observer = m_Observation.Snapshot.Observer;
-		result.Stage = Orders::Api::Stage::Rejected;
-		result.Reason = std::move(reason);
-		return result;
-	}
+		static Api::Wire::Entry& Add(Api::Wire::ScopedPublication& view, Api::Wire::Query::Method method, const std::string& id = {}, const std::string& second = {})
+		{
+			auto& entry = *view.add_entries();
+			entry.mutable_query()->set_method(method);
+			entry.mutable_query()->set_id(id);
+			entry.mutable_query()->set_second_id(second);
+			return entry;
+		}
 
-public:
-	MockProvider() {
-		Reset("mock-session");
-	}
-
-	void Reset(std::string session) {
-		std::lock_guard lock(m_Mutex);
-		m_Ledger.clear();
-		m_ControlledObservations = {"contact-alpha"};
-		m_Observation = {};
-		auto &snapshot = m_Observation.Snapshot;
-		snapshot.SessionId = std::move(session);
-		snapshot.Observer = {"mock-observer"};
-		snapshot.Ready = true;
-		snapshot.Version = 1;
-		using namespace Observations::Api;
-		Instance own;
-		own.Identity = {"contact-alpha"};
-		own.Name = Uncertainty::Api::Exact<std::string>::Known("Mock Vessel");
-		own.Type = Uncertainty::Api::Exact<Catalog::Api::UnitTypeId>::Known({"mock-vessel"});
-		own.Kinematics.Position = PartiallyLocalizedPosition{
-			Physics::Api::Degrees{61.96}, Physics::Api::Degrees{-10.37},
-			ObservedErrorEllipse{Physics::Api::Meters{25}, Physics::Api::Meters{20}, Physics::Api::Radians{0}}};
-		own.Kinematics.Speed = Uncertainty::Api::Exact<Physics::Api::MetersPerSecond>::Known({0});
-		own.Navigation = NavigationObservation{Uncertainty::Api::Exact<std::vector<ObservedRoutePoint>>::Known({})};
-		snapshot.Units.push_back(std::move(own));
-		Instance ambiguous;
-		ambiguous.Identity = {"contact-beta"};
-		ambiguous.Kinematics.Position = PartiallyLocalizedPosition{
-			Physics::Api::Degrees{62}, {},
-			ObservedErrorEllipse{Physics::Api::Meters{500}, Physics::Api::Meters{250}, Physics::Api::Radians{0}}};
-		// This ambiguous fixture deliberately has no correspondence to any simulated UnitId.
-		// The position is a partial localization; no contact name/type is reported.
-		snapshot.Units.push_back(std::move(ambiguous));
-		m_Observation.OrderAvailability.push_back({snapshot.Observer, {"contact-alpha"}, 1,
-			{{Orders::Api::OrderKind::IdleWaypoint, Orders::Api::Availability::Executable, ""},
-			 {Orders::Api::OrderKind::ReplaceRoute, Orders::Api::Availability::Executable, ""},
-			 {Orders::Api::OrderKind::AppendRoute, Orders::Api::Availability::Executable, ""}}});
-	}
-
-	std::expected<Api::ProviderObservation, Api::Error> View() override {
-		std::lock_guard lock(m_Mutex);
-		return m_Observation;
-	}
-
-	Orders::Api::Result Submit(const Orders::Api::ExecutionRequest &request) override {
-		std::lock_guard lock(m_Mutex);
-		using namespace Orders::Api;
-		auto &snapshot = m_Observation.Snapshot;
-		if (request.SessionId != snapshot.SessionId) {
-			return Reject(request, "stale_session");
-		}
-		if (request.Observer != snapshot.Observer) {
-			return Reject(request, "wrong_observer_or_invalid_entity");
-		}
-		if (auto retained = m_Ledger.find(request.RequestId); retained != m_Ledger.end()) {
-			return retained->second;
-		}
-		if (request.RequestId.empty() || request.RequestId.size() > MAXIMUM_REQUEST_ID_CHARACTERS) {
-			return Reject(request, "invalid_arguments");
-		}
-		if (m_Ledger.size() >= MAXIMUM_RETAINED_REQUESTS) {
-			return Reject(request, "ledger_full");
-		}
-		const auto route = std::get_if<RouteCommand>(&request.Payload);
-		const auto unit = std::ranges::find_if(snapshot.Units, [&](const auto &observation) { return observation.Identity == request.Observation; });
-		const auto overlay = std::ranges::find_if(m_Observation.OrderAvailability, [&](const auto &availability) {
-			return availability.Observer == request.Observer && availability.Observation == request.Observation;
-		});
-		Result result;
-		if (unit == snapshot.Units.end() || !m_ControlledObservations.contains(request.Observation.Value)) {
-			result = Reject(request, "wrong_side_or_invalid_entity");
-		} else if (!route) {
-			result = Reject(request, "unsupported_order");
-		} else if (!std::isfinite(route->Latitude.Value) || !std::isfinite(route->Longitude.Value) ||
-			std::abs(route->Latitude.Value) > MAXIMUM_LATITUDE_DEGREES || std::abs(route->Longitude.Value) > MAXIMUM_LONGITUDE_DEGREES) {
-			result = Reject(request, "invalid_arguments");
-		} else if (route->Mode != RouteMode::IdleWaypoint && route->Mode != RouteMode::ReplaceRoute && route->Mode != RouteMode::AppendWaypoint) {
-			result = Reject(request, "unsupported_route_mode");
-		} else if (request.BasedOnVersion != snapshot.Version) {
-			result = Reject(request, "stale_observation");
-		} else if (overlay == m_Observation.OrderAvailability.end()) {
-			result = Reject(request, "order_availability_unknown");
-		} else {
-			const auto kind = route->Mode == RouteMode::ReplaceRoute ? OrderKind::ReplaceRoute :
-				route->Mode == RouteMode::AppendWaypoint ? OrderKind::AppendRoute : OrderKind::IdleWaypoint;
-			const auto eligibility = std::ranges::find_if(overlay->Orders, [&](const auto &entry) { return entry.Kind == kind; });
-			if (eligibility == overlay->Orders.end()) {
-				result = Reject(request, "order_availability_unknown");
-			} else if (eligibility->Availability == Availability::Unsupported) {
-				result = Reject(request, eligibility->Reason.empty() ? "unsupported_order" : eligibility->Reason);
-			} else if (eligibility->Availability != Availability::Executable) {
-				result = Reject(request, eligibility->Reason.empty() ? "order_availability_unknown" : eligibility->Reason);
-			} else {
-				auto &plannedRoute = unit->Navigation->PlannedRoute.Value();
-				if (route->Mode == RouteMode::AppendWaypoint && plannedRoute.size() >= MAXIMUM_ROUTE_POINTS) {
-					result = Reject(request, "route_capacity");
-				} else {
-					result.SessionId = request.SessionId;
-					result.RequestId = request.RequestId;
-					result.Observer = request.Observer;
-					result.Stage = Stage::MovementObserved;
-					result.Reason = "mock_displacement";
-					result.SampledAt = {1};
-					result.Displacement = Physics::Api::Meters{SYNTHETIC_DISPLACEMENT_METERS};
-					result.Mode = route->Mode;
-					for (const auto &point : plannedRoute) {
-						result.RouteBefore.push_back(point);
+	public:
+		std::shared_ptr<const Api::Wire::Publication> Publication() const override
+		{
+			namespace Wire = Api::Wire;
+			std::lock_guard lock{m_Mutex};
+			auto result = std::make_shared<Wire::Publication>();
+			result->set_session(m_Session);
+			result->set_revision(m_Revision);
+			result->set_captured_at_seconds(m_Time);
+			for (const std::string faction : {"", "blue", "red"})
+			{
+				auto& view = *result->add_views();
+				if (faction.empty())
+				{
+					view.mutable_scope()->mutable_omniscient();
+				}
+				else
+				{
+					view.mutable_scope()->set_faction(faction);
+				}
+				auto& ids = *Add(view, Wire::Query::UNIT_IDS).mutable_result()->mutable_ids();
+				for (const std::string unitFaction : {"blue", "red"})
+				{
+					if (!faction.empty() && faction != unitFaction)
+					{
+						continue;
 					}
-					if (route->Mode == RouteMode::ReplaceRoute) {
-						plannedRoute.clear();
-					}
-					plannedRoute.push_back({{route->Latitude, route->Longitude, {}}, "NC-" + request.RequestId});
-					std::get<Observations::Api::PartiallyLocalizedPosition>(unit->Kinematics.Position).Latitude->Value += SYNTHETIC_LATITUDE_CHANGE_DEGREES;
-					for (const auto &point : plannedRoute) {
-						result.RouteAfter.push_back(point);
-					}
-					overlay->Orders[0].Availability = Availability::Blocked;
-					overlay->Orders[0].Reason = "native_task_selection_active";
-					if (route->Mode != RouteMode::IdleWaypoint) {
-						result.Stage = Stage::RouteMutated;
-						result.Reason = "mock_route_sequence";
-						result.Displacement.reset();
+					const auto identity = "truth-" + unitFaction;
+					ids.add_values(identity);
+					Units::Api::Instance unit{};
+					unit.Identity.Value = identity;
+					unit.Faction.Value = unitFaction;
+					unit.Name = "Synthetic " + unitFaction;
+					unit.Type.Value = "frigate";
+					unit.Kinematics.Position = Physics::Api::Position{{54}, {unitFaction == "blue" ? 8.0 : 8.3}, {0}};
+					unit.Kinematics.Speed = Physics::Api::MetersPerSecond{4};
+					unit.Kinematics.Heading = Physics::Api::Radians{1.5};
+					*Add(view, Wire::Query::UNIT, identity).mutable_result()->mutable_unit() = Api::Encode(unit);
+					Operations::Api::UnitState operations{};
+					operations.CurrentActivity = Operations::Api::Idle{};
+					operations.NavigationState.emplace();
+					*Add(view, Wire::Query::OPERATIONS, identity).mutable_result()->mutable_operations() = Api::Encode(operations);
+				}
+				auto& observations = *Add(view, Wire::Query::OBSERVATION_IDS).mutable_result()->mutable_ids();
+				if (!faction.empty())
+				{
+					observations.add_values("contact-1");
+					Observations::Api::Instance observation{};
+					observation.Identity.Value = "contact-1";
+					observation.ObservationName = "Synthetic uncertain contact";
+					observation.ObserverFaction.Value = faction;
+					Observations::Api::PartiallyLocalizedPosition partial;
+					partial.Latitude = Physics::Api::Degrees{54.1};
+					partial.Longitude = Physics::Api::Degrees{faction == "blue" ? 8.4 : 8.1};
+					partial.ErrorEllipse = Observations::Api::ObservedErrorEllipse{{1500}, {500}, {0.4}};
+					observation.Kinematics.Position = partial;
+					observation.Type = decltype(observation.Type)::Known(Units::Api::Classification::SurfaceVessel);
+					*Add(view, Wire::Query::OBSERVATION, observation.Identity.Value).mutable_result()->mutable_observation() = Api::Encode(observation);
+				}
+				auto& factions = *Add(view, Wire::Query::FACTION_IDS).mutable_result()->mutable_ids();
+				factions.add_values("blue");
+				factions.add_values("red");
+				for (const std::string first : {"blue", "red"})
+				{
+					for (const std::string second : {"blue", "red"})
+					{
+						Add(view, Wire::Query::FACTION_ALIGNMENT, first, second)
+							.mutable_result()
+							->set_alignment(static_cast<int>(first == second ? Factions::Api::Alignment::Friendly : Factions::Api::Alignment::Hostile));
 					}
 				}
+				Add(view, Wire::Query::UNIT_TYPE_IDS).mutable_result()->mutable_ids()->add_values("frigate");
+				Units::Api::Type type{{"frigate"}, Units::Api::Classification::SurfaceVessel, {}};
+				*Add(view, Wire::Query::UNIT_TYPE, "frigate").mutable_result()->mutable_unit_type() = Api::Encode(type);
+				Add(view, Wire::Query::EQUIPMENT_TYPE_IDS).mutable_result()->mutable_ids();
+				Add(view, Wire::Query::RESOURCE_IDS).mutable_result()->mutable_ids();
+				Add(view, Wire::Query::TIME).mutable_result()->set_time_seconds(m_Time);
+				Add(view, Wire::Query::PAUSED).mutable_result()->set_boolean(m_PlayerPaused || !m_PauseOwners.empty());
+				Add(view, Wire::Query::CAN_PAUSE).mutable_result()->set_boolean(true);
+				Add(view, Wire::Query::CAN_UNPAUSE).mutable_result()->set_boolean(true);
+				Add(view, Wire::Query::COMPRESSION).mutable_result()->set_compression(m_Compression);
 			}
+			return result;
 		}
-		m_Ledger[request.RequestId] = result;
-		return result;
-	}
 
-	Orders::Api::Result Status(const std::string &sessionId, const std::string &requestId) override {
-		std::lock_guard lock(m_Mutex);
-		if (sessionId != m_Observation.Snapshot.SessionId) {
-			return {sessionId, requestId, m_Observation.Snapshot.Observer, Orders::Api::Stage::Rejected, "stale_session"};
-		}
-		if (auto retained = m_Ledger.find(requestId); retained != m_Ledger.end()) {
-			const auto &route = m_Observation.Snapshot.Units[0].Navigation->PlannedRoute.Value();
-			if (retained->second.Stage == Orders::Api::Stage::RouteMutated && !route.empty() && route.front().Label == "NC-" + requestId) {
-				retained->second.Stage = Orders::Api::Stage::MovementObserved;
-				retained->second.Reason = "mock_route_head_displacement";
-				retained->second.Displacement = Physics::Api::Meters{SYNTHETIC_DISPLACEMENT_METERS};
+		Error::Api::Result<Api::Wire::Result> Apply(const Api::Wire::Control& control, std::chrono::steady_clock::time_point deadline) override
+		{
+			std::lock_guard lock{m_Mutex};
+			if (control.session() != m_Session || std::chrono::steady_clock::now() >= deadline)
+			{
+				return std::unexpected(Error::Api::MakeError(Error::Api::ErrorCondition::NotReady));
 			}
-			return retained->second;
+			Api::Wire::Result result;
+			if (control.has_pause())
+			{
+				if (control.pause())
+				{
+					m_PauseOwners.insert(control.client());
+				}
+				else
+				{
+					m_PauseOwners.erase(control.client());
+				}
+			}
+			else if (control.has_compression())
+			{
+				// Deliberate mock factors, not discovered Sea Power capabilities.
+				if (control.compression() != 1 && control.compression() != 2 && control.compression() != 4)
+				{
+					result.mutable_failure()->set_simulation(static_cast<int>(Simulation::Api::Error::InvalidTimeCompression));
+					return result;
+				}
+				m_Compression = control.compression();
+			}
+			else
+			{
+				return std::unexpected(Error::Api::MakeError(Error::Api::ErrorCondition::ContractError));
+			}
+			++m_Revision;
+			result.mutable_success();
+			return result;
 		}
-		Orders::Api::Result result;
-		result.SessionId = sessionId;
-		result.RequestId = requestId;
-		result.Observer = m_Observation.Snapshot.Observer;
-		result.Stage = Orders::Api::Stage::Unknown;
-		result.Reason = "unknown_or_expired_request";
-		return result;
-	}
 
-	void Block() {
-		std::lock_guard lock(m_Mutex);
-		for (auto &eligibility : m_Observation.OrderAvailability[0].Orders) {
-			eligibility.Availability = Orders::Api::Availability::Blocked;
-			eligibility.Reason = "protected_native_action";
-	}
+		void Disconnected(const std::string& client) override
+		{
+			std::lock_guard lock{m_Mutex};
+			m_PauseOwners.erase(client);
+			++m_Revision;
 		}
 
-	void RevokeControl() {
-		std::lock_guard lock(m_Mutex);
-		m_ControlledObservations.clear();
-	}
+		void PlayerPause(bool paused)
+		{
+			std::lock_guard lock{m_Mutex};
+			m_PlayerPaused = paused;
+			++m_Revision;
+		}
 
-	void ForgetAvailability() {
-		std::lock_guard lock(m_Mutex);
-		m_Observation.OrderAvailability.clear();
-	}
-};
+		void PlayerCompression(double factor)
+		{
+			std::lock_guard lock{m_Mutex};
+			m_Compression = factor;
+			++m_Revision;
+		}
+
+		void Reload(std::string session)
+		{
+			std::lock_guard lock{m_Mutex};
+			m_Session = std::move(session);
+			m_PauseOwners.clear();
+			m_PlayerPaused = false;
+			m_Time = 0;
+			++m_Revision;
+		}
+	};
 }

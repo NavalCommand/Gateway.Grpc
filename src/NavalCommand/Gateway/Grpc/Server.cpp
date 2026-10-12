@@ -1,150 +1,270 @@
-#include <NavalCommand/Gateway/Api/Codec.h>
+#include <NavalCommand/Error/Api/MakeError.h>
 #include <NavalCommand/Gateway/Grpc/Server.h>
 #include <algorithm>
+#include <atomic>
 #include <charconv>
-#include <chrono>
-#include <string_view>
+#include <condition_variable>
+#include <deque>
+#include <iomanip>
+#include <mutex>
+#include <random>
+#include <set>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
 
-namespace NavalCommand::Gateway::Grpc {
-namespace {
-constexpr int MAXIMUM_MESSAGE_BYTES = 1'048'576;
-constexpr unsigned MAXIMUM_TCP_PORT = 65'535;
-constexpr auto SHUTDOWN_GRACE_PERIOD = std::chrono::seconds(1);
-constexpr std::string_view LOOPBACK_PREFIX = "127.0.0.1:";
-}
-Server::Server(Api::IProvider &provider, std::shared_ptr<spdlog::logger> logger) : m_Provider{provider}, m_Logger{std::move(logger)} {
-}
+namespace NavalCommand::Gateway::Grpc
+{
+	namespace Wire = Api::Wire;
+	namespace
+	{
+		constexpr std::size_t MAXIMUM_CLIENTS = 16;
+		constexpr std::size_t MAXIMUM_REVISIONS_PER_CLIENT = 16;
+		constexpr int MAXIMUM_MESSAGE_BYTES = 16 * 1024 * 1024;
+		constexpr auto HEARTBEAT_INTERVAL = std::chrono::milliseconds(250);
+		constexpr auto REVISION_LIFETIME = std::chrono::seconds(30);
+		std::string NewIdentity()
+		{
+			// Private transport capabilities; never uses the simulator RNG.
+			std::random_device random;
+			std::ostringstream text;
+			text << std::hex << std::setfill('0');
+			for (int word = 0; word < 4; ++word)
+			{
+				text << std::setw(8) << random();
+			}
+			return text.str();
+		}
 
-Server::~Server() {
-	Stop();
-}
+		Wire::Result Failure(Error::Api::ErrorCondition condition)
+		{
+			Wire::Result result;
+			*result.mutable_failure()->mutable_infrastructure() = Api::Encode(Error::Api::MakeError(condition));
+			return result;
+		}
 
-std::expected<void, Api::Error> Server::Start(const std::string &endpoint) {
-	if (m_Server || !endpoint.starts_with(LOOPBACK_PREFIX)) {
-		return std::unexpected(Api::Error::Malformed);
-	}
-	const auto portText = endpoint.substr(LOOPBACK_PREFIX.size());
-	unsigned portNumber = 0;
-	const auto portParseResult = std::from_chars(portText.data(), portText.data() + portText.size(), portNumber);
-	if (portParseResult.ec != std::errc{} || portParseResult.ptr != portText.data() + portText.size() || portNumber == 0 || portNumber > MAXIMUM_TCP_PORT) {
-		return std::unexpected(Api::Error::Malformed);
-	}
-	grpc::ServerBuilder serverBuilder;
-	serverBuilder.SetMaxReceiveMessageSize(MAXIMUM_MESSAGE_BYTES);
-	serverBuilder.SetMaxSendMessageSize(MAXIMUM_MESSAGE_BYTES);
-	int port = 0;
-	serverBuilder.AddListeningPort(endpoint, grpc::InsecureServerCredentials(), &port);
-	serverBuilder.RegisterService(this);
-	m_Server = serverBuilder.BuildAndStart();
-	if (!m_Server || port == 0) {
-		return std::unexpected(Api::Error::Busy);
-	}
-	if (m_Logger) {
-		m_Logger->info("Gateway listening {}", endpoint);
-	}
-	return {};
-}
+		bool SameScope(const Wire::Scope& first, const Wire::Scope& second)
+		{
+			return first.kind_case() == second.kind_case() && first.faction() == second.faction();
+		}
 
-void Server::Stop() {
-	if (m_Server) {
-		m_Server->Shutdown(std::chrono::system_clock::now() + SHUTDOWN_GRACE_PERIOD);
-		m_Server->Wait();
-		m_Server.reset();
+		bool SameQuery(const Wire::Query& first, const Wire::Query& second)
+		{
+			return first.method() == second.method() && first.id() == second.id() && first.second_id() == second.second_id();
+		}
 	}
-}
 
-grpc::Status Server::Connect(grpc::ServerContext *, const Api::Wire::Query *, Api::Wire::Session *response) {
-	auto providerView = m_Provider.View();
-	if (!providerView) {
-		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
-	}
-	response->set_schema_version(4);
-	response->set_session_id(providerView->Snapshot.SessionId);
-	response->mutable_observer()->set_value(providerView->Snapshot.Observer.Value);
-	response->set_ready(providerView->Snapshot.Ready);
-	return grpc::Status::OK;
-}
+	class Server::Service final : public Wire::Gateway::Service
+	{
+		struct RetainedRevision
+		{
+			std::string Client;
+			std::shared_ptr<const Wire::Publication> Publication;
+			int ViewIndex;
+			std::chrono::steady_clock::time_point Expires;
+		};
 
-grpc::Status Server::GetView(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::ObserverSnapshot *response) {
-	auto providerView = m_Provider.View();
-	if (!providerView || !providerView->Snapshot.Ready) {
-		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
-	}
-	if (query->session_id().empty() || query->observer().value().empty()) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "session_and_observer_required"};
-	}
-	if (query->session_id() != providerView->Snapshot.SessionId) {
-		return {grpc::StatusCode::FAILED_PRECONDITION, "stale_session"};
-	}
-	if (query->observer().value() != providerView->Snapshot.Observer.Value) {
-		return {grpc::StatusCode::NOT_FOUND, "wrong_observer"};
-	}
-	try {
-		*response = Api::Encode(providerView->Snapshot);
-	} catch (const std::invalid_argument &) {
-		return {grpc::StatusCode::FAILED_PRECONDITION, "invalid_provider_observation"};
-	}
-	return grpc::Status::OK;
-}
+		Api::IProvider& m_Provider;
+		std::mutex m_Mutex;
+		std::set<std::string> m_Clients;
+		std::unordered_map<std::string, RetainedRevision> m_Revisions;
+		std::unordered_map<std::string, std::deque<std::string>> m_ClientRevisions;
 
-grpc::Status Server::DiscoverOrders(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::OrderDiscovery *response) {
-	auto providerView = m_Provider.View();
-	if (!providerView || !providerView->Snapshot.Ready) {
-		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
-	}
-	if (query->observation().value().empty() || query->observer().value().empty()) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "observer_and_observation_required"};
-	}
-	if (query->session_id() != providerView->Snapshot.SessionId) {
-		return {grpc::StatusCode::FAILED_PRECONDITION, "stale_session"};
-	}
-	if (query->observer().value() != providerView->Snapshot.Observer.Value) {
-		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_entity"};
-	}
-	const auto unit = std::ranges::find_if(providerView->Snapshot.Units, [&](const auto &observation) {
-		return observation.Identity.Value == query->observation().value();
-	});
-	if (unit == providerView->Snapshot.Units.end()) {
-		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_entity"};
-	}
-	const auto availability = std::ranges::find_if(providerView->OrderAvailability, [&](const auto &entry) {
-		return entry.Observer == providerView->Snapshot.Observer &&
-			entry.Observation.Value == query->observation().value();
-	});
-	if (availability == providerView->OrderAvailability.end()) {
-		return {grpc::StatusCode::FAILED_PRECONDITION, "order_availability_unknown"};
-	}
-	try {
-		*response = Api::Encode(*availability);
-		response->set_session_id(providerView->Snapshot.SessionId);
-	} catch (const std::invalid_argument &) {
-		return {grpc::StatusCode::FAILED_PRECONDITION, "invalid_provider_observation"};
-	}
-	return grpc::Status::OK;
-}
+	public:
+		explicit Service(Api::IProvider& provider) : m_Provider{provider}
+		{
+		}
 
-grpc::Status Server::SubmitOrder(grpc::ServerContext *, const Api::Wire::OrderRequest *query, Api::Wire::OrderResult *response) {
-	try {
-		*response = Api::Encode(m_Provider.Submit(Api::Decode(*query)));
-	} catch (const std::invalid_argument &) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "invalid_order_payload"};
-	}
-	return grpc::Status::OK;
-}
+		grpc::Status Connect(grpc::ServerContext* context, const Wire::ConnectionRequest*, grpc::ServerWriter<Wire::ConnectionState>* writer) override
+		{
+			const auto client = NewIdentity();
+			{
+				std::lock_guard lock{m_Mutex};
+				if (m_Clients.size() >= MAXIMUM_CLIENTS)
+				{
+					return {grpc::StatusCode::RESOURCE_EXHAUSTED, "client_capacity"};
+				}
+				m_Clients.insert(client);
+			}
+			Wire::ConnectionState state;
+			state.set_client(client);
+			while (!context->IsCancelled())
+			{
+				auto publication = m_Provider.Publication();
+				state.set_session(publication ? publication->session() : "");
+				if (!writer->Write(state))
+				{
+					break;
+				}
+				std::this_thread::sleep_for(HEARTBEAT_INTERVAL);
+			}
+			{
+				std::lock_guard lock{m_Mutex};
+				m_Clients.erase(client);
+				for (const auto& token : m_ClientRevisions[client])
+				{
+					m_Revisions.erase(token);
+				}
+				m_ClientRevisions.erase(client);
+			}
+			m_Provider.Disconnected(client);
+			return grpc::Status::OK;
+		}
 
-grpc::Status Server::GetStatus(grpc::ServerContext *, const Api::Wire::Query *query, Api::Wire::OrderResult *response) {
-	if (query->observer().value().empty()) {
-		return {grpc::StatusCode::INVALID_ARGUMENT, "observer_required"};
+		grpc::Status Acquire(grpc::ServerContext*, const Wire::AcquireRequest* request, Wire::Revision* result) override
+		{
+			std::lock_guard lock{m_Mutex};
+			if (!m_Clients.contains(request->client()))
+			{
+				return {grpc::StatusCode::UNAUTHENTICATED, "connection_required"};
+			}
+			auto publication = m_Provider.Publication();
+			if (!publication || publication->session().empty())
+			{
+				return {grpc::StatusCode::UNAVAILABLE, "mission_unavailable"};
+			}
+			for (int index = 0; index < publication->views_size(); ++index)
+			{
+				if (!SameScope(request->scope(), publication->views(index).scope()))
+				{
+					continue;
+				}
+				const auto token = NewIdentity();
+				auto& clientRevisions = m_ClientRevisions[request->client()];
+				while (clientRevisions.size() >= MAXIMUM_REVISIONS_PER_CLIENT)
+				{
+					m_Revisions.erase(clientRevisions.front());
+					clientRevisions.pop_front();
+				}
+				clientRevisions.push_back(token);
+				m_Revisions.emplace(token, RetainedRevision{request->client(), publication, index, std::chrono::steady_clock::now() + REVISION_LIFETIME});
+				result->set_token(token);
+				result->set_session(publication->session());
+				result->set_revision(publication->revision());
+				result->set_captured_at_seconds(publication->captured_at_seconds());
+				return grpc::Status::OK;
+			}
+			return {grpc::StatusCode::PERMISSION_DENIED, "scope_unavailable"};
+		}
+
+		grpc::Status Read(grpc::ServerContext*, const Wire::ReadRequest* request, Wire::Result* result) override
+		{
+			std::lock_guard lock{m_Mutex};
+			auto revision = m_Revisions.find(request->token());
+			auto current = m_Provider.Publication();
+			if (!m_Clients.contains(request->client()) || revision == m_Revisions.end() || revision->second.Client != request->client())
+			{
+				*result = Failure(Error::Api::ErrorCondition::PermissionDenied);
+				return grpc::Status::OK;
+			}
+			if (!current || current->session() != revision->second.Publication->session() || std::chrono::steady_clock::now() >= revision->second.Expires)
+			{
+				*result = Failure(Error::Api::ErrorCondition::NotReady);
+				return grpc::Status::OK;
+			}
+			const auto& view = revision->second.Publication->views(revision->second.ViewIndex);
+			for (const auto& entry : view.entries())
+			{
+				if (SameQuery(request->query(), entry.query()))
+				{
+					*result = entry.result();
+					return grpc::Status::OK;
+				}
+			}
+			// Identical denied lookup results regardless of hidden unit existence.
+			*result = Failure(Error::Api::ErrorCondition::NotFound);
+			return grpc::Status::OK;
+		}
+
+		grpc::Status Apply(grpc::ServerContext* context, const Wire::ApplyRequest* request, Wire::Result* result) override
+		{
+			// Serialize controls with disconnect removal. Disconnected() cannot
+			// overtake an accepted request and then leave a late orphan claim.
+			std::lock_guard lock{m_Mutex};
+			auto publication = m_Provider.Publication();
+			if (!m_Clients.contains(request->client()))
+			{
+				*result = Failure(Error::Api::ErrorCondition::PermissionDenied);
+				return grpc::Status::OK;
+			}
+			if (!publication || request->control().session() != publication->session())
+			{
+				*result = Failure(Error::Api::ErrorCondition::NotReady);
+				return grpc::Status::OK;
+			}
+			if (request->control().has_disconnected() || request->control().action_case() == Wire::Control::ACTION_NOT_SET)
+			{
+				*result = Failure(Error::Api::ErrorCondition::ContractError);
+				return grpc::Status::OK;
+			}
+			auto control = request->control();
+			control.set_client(request->client());
+			const auto remaining = context->deadline() - std::chrono::system_clock::now();
+			const auto boundedRemaining = std::min(remaining, std::chrono::system_clock::duration{std::chrono::seconds{1}});
+			auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(boundedRemaining);
+			auto applied = m_Provider.Apply(control, deadline);
+			if (applied)
+			{
+				*result = *applied;
+			}
+			else
+			{
+				*result->mutable_failure()->mutable_infrastructure() = Api::Encode(applied.error());
+			}
+			return grpc::Status::OK;
+		}
+	};
+
+	Server::Server(Api::IProvider& provider) : m_Service{std::make_unique<Service>(provider)}
+	{
 	}
-	auto providerView = m_Provider.View();
-	if (!providerView || !providerView->Snapshot.Ready) {
-		return {grpc::StatusCode::UNAVAILABLE, "provider_not_ready"};
+
+	Server::~Server()
+	{
+		Stop();
 	}
-	if (query->session_id() == providerView->Snapshot.SessionId &&
-		query->observer().value() != providerView->Snapshot.Observer.Value) {
-		return {grpc::StatusCode::NOT_FOUND, "wrong_observer_or_invalid_request"};
+
+	Error::Api::Result<void> Server::Start(const std::string& endpoint)
+	{
+		constexpr std::string_view PREFIX = "127.0.0.1:";
+		if (m_Server || !endpoint.starts_with(PREFIX))
+		{
+			return std::unexpected(Error::Api::MakeError(Error::Api::ErrorCondition::ContractError));
+		}
+		unsigned port = 0;
+		const auto text = std::string_view{endpoint}.substr(PREFIX.size());
+		const auto parsed = std::from_chars(text.data(), text.data() + text.size(), port);
+		if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || port > 65535)
+		{
+			return std::unexpected(Error::Api::MakeError(Error::Api::ErrorCondition::ContractError));
+		}
+		grpc::ServerBuilder builder;
+		builder.SetMaxReceiveMessageSize(MAXIMUM_MESSAGE_BYTES);
+		builder.SetMaxSendMessageSize(MAXIMUM_MESSAGE_BYTES);
+		builder.RegisterService(m_Service.get());
+		int selectedPort = 0;
+		builder.AddListeningPort(endpoint, grpc::InsecureServerCredentials(), &selectedPort);
+		m_Server = builder.BuildAndStart();
+		if (!m_Server)
+		{
+			return std::unexpected(Error::Api::MakeError(Error::Api::ErrorCondition::CommunicationError));
+		}
+		m_Port = selectedPort;
+		return {};
 	}
-	*response = Api::Encode(m_Provider.Status(query->session_id(), query->request_id()));
-	return grpc::Status::OK;
-}
+
+	void Server::Stop()
+	{
+		if (m_Server)
+		{
+			m_Server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
+			m_Server->Wait();
+			m_Server.reset();
+		}
+	}
+
+	int Server::Port() const
+	{
+		return m_Port;
+	}
 }
