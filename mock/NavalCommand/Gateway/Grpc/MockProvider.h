@@ -24,7 +24,7 @@ class MockProvider final : public Api::IProvider {
 	std::set<std::string> m_ControlledObservations;
 	std::map<std::string, Orders::Api::Result> m_Ledger;
 
-	Orders::Api::Result Reject(const Orders::Api::Request &request, std::string reason) const {
+	Orders::Api::Result Reject(const Orders::Api::ExecutionRequest &request, std::string reason) const {
 		Orders::Api::Result result;
 		result.SessionId = request.SessionId;
 		result.RequestId = request.RequestId;
@@ -50,7 +50,7 @@ public:
 		snapshot.Ready = true;
 		snapshot.Version = 1;
 		using namespace Observations::Api;
-		UnitObservation own;
+		Instance own;
 		own.Identity = {"contact-alpha"};
 		own.Name = Uncertainty::Api::Exact<std::string>::Known("Mock Vessel");
 		own.Type = Uncertainty::Api::Exact<Catalog::Api::UnitTypeId>::Known({"mock-vessel"});
@@ -60,7 +60,7 @@ public:
 		own.Kinematics.Speed = Uncertainty::Api::Exact<Physics::Api::MetersPerSecond>::Known({0});
 		own.Navigation = NavigationObservation{Uncertainty::Api::Exact<std::vector<ObservedRoutePoint>>::Known({})};
 		snapshot.Units.push_back(std::move(own));
-		UnitObservation ambiguous;
+		Instance ambiguous;
 		ambiguous.Identity = {"contact-beta"};
 		ambiguous.Kinematics.Position = PartiallyLocalizedPosition{
 			Physics::Api::Degrees{62}, {},
@@ -79,7 +79,7 @@ public:
 		return m_Observation;
 	}
 
-	Orders::Api::Result Submit(const Orders::Api::Request &request) override {
+	Orders::Api::Result Submit(const Orders::Api::ExecutionRequest &request) override {
 		std::lock_guard lock(m_Mutex);
 		using namespace Orders::Api;
 		auto &snapshot = m_Observation.Snapshot;
