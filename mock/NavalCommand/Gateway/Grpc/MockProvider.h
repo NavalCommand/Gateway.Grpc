@@ -1,5 +1,6 @@
 #pragma once
 
+#include <NavalCommand/Classification/Api/Alignment.h>
 #include <NavalCommand/Error/Api/MakeError.h>
 #include <NavalCommand/Gateway/Api/IProvider.h>
 #include <NavalCommand/Simulation/Api/Error.h>
@@ -62,6 +63,7 @@ namespace NavalCommand::Gateway::Grpc
 					unit.Faction.Value = unitFaction;
 					unit.Name = "Synthetic " + unitFaction;
 					unit.Type.Value = "frigate";
+					unit.CurrentLoadout = {"empty"};
 					unit.Kinematics.Position = Physics::Api::Position{{54}, {unitFaction == "blue" ? 8.0 : 8.3}, {0}};
 					unit.Kinematics.Speed = Physics::Api::MetersPerSecond{4};
 					unit.Kinematics.Heading = Physics::Api::Radians{1.5};
@@ -84,7 +86,8 @@ namespace NavalCommand::Gateway::Grpc
 					partial.Longitude = Physics::Api::Degrees{faction == "blue" ? 8.4 : 8.1};
 					partial.ErrorEllipse = Observations::Api::ObservedErrorEllipse{{1500}, {500}, {0.4}};
 					observation.Kinematics.Position = partial;
-					observation.Type = decltype(observation.Type)::Known(Units::Api::Classification::SurfaceVessel);
+					observation.Type = decltype(observation.Type)::Known<Classification::Api::Category>(Classification::Api::Category::SurfaceVessel);
+					observation.IsDestroyed = decltype(observation.IsDestroyed)::Known(false);
 					*Add(view, Wire::Query::OBSERVATION, observation.Identity.Value).mutable_result()->mutable_observation() = Api::Encode(observation);
 				}
 				auto& factions = *Add(view, Wire::Query::FACTION_IDS).mutable_result()->mutable_ids();
@@ -96,11 +99,12 @@ namespace NavalCommand::Gateway::Grpc
 					{
 						Add(view, Wire::Query::FACTION_ALIGNMENT, first, second)
 							.mutable_result()
-							->set_alignment(static_cast<int>(first == second ? Factions::Api::Alignment::Friendly : Factions::Api::Alignment::Hostile));
+							->set_alignment(static_cast<int>(first == second ? Classification::Api::Alignment::Friendly : Classification::Api::Alignment::Hostile));
 					}
 				}
 				Add(view, Wire::Query::UNIT_TYPE_IDS).mutable_result()->mutable_ids()->add_values("frigate");
-				Units::Api::Type type{{"frigate"}, Units::Api::Classification::SurfaceVessel, {}};
+				Units::Api::Type type{{"frigate"}, Classification::Api::SubCategory::Frigate, {}, {}};
+				type.Loadouts.push_back({{"empty"}, {}, {}});
 				*Add(view, Wire::Query::UNIT_TYPE, "frigate").mutable_result()->mutable_unit_type() = Api::Encode(type);
 				Add(view, Wire::Query::EQUIPMENT_TYPE_IDS).mutable_result()->mutable_ids();
 				Add(view, Wire::Query::RESOURCE_IDS).mutable_result()->mutable_ids();
