@@ -103,8 +103,12 @@ namespace NavalCommand::Gateway::Grpc
 					}
 				}
 				Add(view, Wire::Query::UNIT_TYPE_IDS).mutable_result()->mutable_ids()->add_values("frigate");
-				Units::Api::Type type{{"frigate"}, Classification::Api::SubCategory::Frigate, {}, {}};
-				type.Loadouts.push_back({{"empty"}, {}, {}});
+				Units::Api::Type type{};
+				type.Id = {"frigate"};
+				type.UnitSubCategory = Classification::Api::SubCategory::Frigate;
+				Equipment::Api::Loadout loadout{};
+				loadout.Id = {"empty"};
+				type.Loadouts.push_back(std::move(loadout));
 				*Add(view, Wire::Query::UNIT_TYPE, "frigate").mutable_result()->mutable_unit_type() = Api::Encode(type);
 				Add(view, Wire::Query::EQUIPMENT_TYPE_IDS).mutable_result()->mutable_ids();
 				Add(view, Wire::Query::RESOURCE_IDS).mutable_result()->mutable_ids();
